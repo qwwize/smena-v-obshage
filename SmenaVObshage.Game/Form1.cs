@@ -11,6 +11,10 @@ public partial class Form1 : Form
     private const float ChaosPassivePerSecond = 1.2f;
     private const float ChaosPenaltyOnFail = 14f;
     private const float ChaosReduceOnComplete = 7f;
+    private const float DifficultyStepSeconds = 60f;
+    private const int MinSpawnIntervalTicks = 120;
+    private const float HighChaosThreshold = 80f;
+    private const float HighChaosDefeatSeconds = 20f;
 
     private readonly System.Windows.Forms.Timer _gameTimer = new();
     private readonly HashSet<Keys> _pressedKeys = [];
@@ -30,7 +34,9 @@ public partial class Form1 : Form
     private bool _eWasDown;
     private int _completedCount;
     private float _sessionTimeLeftSeconds = SessionDurationSeconds;
+    private float _elapsedSessionSeconds;
     private float _chaosLevel;
+    private float _highChaosSeconds;
     private bool _isPaused;
     private bool _isGameOver;
     private bool _isVictory;
@@ -51,6 +57,11 @@ public partial class Form1 : Form
         Paint += Form1_Paint;
         KeyDown += Form1_KeyDown;
         KeyUp += Form1_KeyUp;
+        Deactivate += (_, _) =>
+        {
+            _pressedKeys.Clear();
+            _eWasDown = false;
+        };
         Shown += (_, _) =>
         {
             SeedInitialTasks();
@@ -78,6 +89,8 @@ public partial class Form1 : Form
         _eWasDown = false;
         _completedCount = 0;
         _chaosLevel = 0f;
+        _elapsedSessionSeconds = 0f;
+        _highChaosSeconds = 0f;
         _sessionTimeLeftSeconds = SessionDurationSeconds;
         _isPaused = false;
         _isGameOver = false;
@@ -96,8 +109,23 @@ public partial class Form1 : Form
         }
 
         var dtSeconds = _gameTimer.Interval / 1000f;
+        _elapsedSessionSeconds = Math.Min(SessionDurationSeconds, _elapsedSessionSeconds + dtSeconds);
         _sessionTimeLeftSeconds = Math.Max(0f, _sessionTimeLeftSeconds - dtSeconds);
         _chaosLevel = Math.Clamp(_chaosLevel + ChaosPassivePerSecond * dtSeconds, 0f, 100f);
+        if (_chaosLevel >= HighChaosThreshold)
+        {
+            _highChaosSeconds += dtSeconds;
+            if (_highChaosSeconds >= HighChaosDefeatSeconds)
+            {
+                FinishByChaos();
+                Invalidate();
+                return;
+            }
+        }
+        else
+        {
+            _highChaosSeconds = 0f;
+        }
 
         if (_sessionTimeLeftSeconds <= 0f)
         {
@@ -170,8 +198,7 @@ public partial class Form1 : Form
 
         var nextTask = _taskQueue[0];
         _taskQueue.RemoveAt(0);
-        GenerateObstacleLayout();
-        _currentTask = RebuildTaskForCurrentLayout(nextTask);
+        _currentTask = BuildReachableCurrentTask(nextTask);
     }
 
     private void TrySpawnTask()
@@ -183,7 +210,7 @@ public partial class Form1 : Form
             return;
         }
 
-        if (++_spawnCooldownTicks < SpawnIntervalTicks)
+        if (++_spawnCooldownTicks < GetCurrentSpawnIntervalTicks())
         {
             return;
         }
@@ -305,6 +332,14 @@ public partial class Form1 : Form
         _statusTicksRemaining = 0;
     }
 
+    private void FinishByChaos()
+    {
+        _isGameOver = true;
+        _isVictory = false;
+        _statusMessage = "Поражение хаос вышел из-под контроля";
+        _statusTicksRemaining = 0;
+    }
+
     private bool PlayerInZone(RectangleF zone)
     {
         // Считаем попадание по центру игрока
@@ -333,8 +368,7 @@ public partial class Form1 : Form
 
     private GameEventKind PickRandomKind()
     {
-        // Небольшой шанс на срочную задачу коменданта
-        if (_random.Next(100) < 14)
+        if (_random.Next(100) < GetUrgentChancePercent())
         {
             return GameEventKind.CommandantCheck;
         }
@@ -348,6 +382,21 @@ public partial class Form1 : Form
         ];
 
         return normal[_random.Next(normal.Length)];
+    }
+
+    private int GetDifficultyStage() => (int)(_elapsedSessionSeconds / DifficultyStepSeconds);
+
+    private int GetCurrentSpawnIntervalTicks()
+    {
+        var stage = GetDifficultyStage();
+        var interval = SpawnIntervalTicks - stage * 24;
+        return Math.Max(MinSpawnIntervalTicks, interval);
+    }
+
+    private int GetUrgentChancePercent()
+    {
+        var stage = GetDifficultyStage();
+        return Math.Min(40, 14 + stage * 6);
     }
 
     private GameTask CreateTask(GameEventKind kind)
@@ -553,14 +602,14 @@ public partial class Form1 : Form
         AddVerticalWall(minX + 220, minY, maxY, t);
         AddVerticalWall(minX + 480, minY, maxY, t);
 
-        for (var i = 0; i < 4; i++)
+        for (var i = 0; i < 5; i++)
         {
             var w = _random.Next(56, 86);
             var h = _random.Next(42, 72);
             var x = _random.Next((int)minX + 20, (int)maxX - w - 20);
             var y = _random.Next((int)minY + 20, (int)maxY - h - 20);
             var candidate = new RectangleF(x, y, w, h);
-            if (!IntersectsAny(candidate))
+            if (!IntersectsAny(candidate) && !TooCloseToWalls(candidate, 16f))
             {
                 _solidBlocks.Add(candidate);
             }
@@ -622,6 +671,20 @@ public partial class Form1 : Form
         return false;
     }
 
+    private bool TooCloseToWalls(RectangleF rect, float margin)
+    {
+        var inflated = RectangleF.Inflate(rect, margin, margin);
+        foreach (var wall in _wallSegments)
+        {
+            if (inflated.IntersectsWith(wall))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void EnsurePlayerOutsideObstacles()
     {
         if (!IntersectsObstacles(GetPlayerRect(_playerPosition)))
@@ -664,6 +727,98 @@ public partial class Form1 : Form
             TimeLimitSeconds = task.TimeLimitSeconds,
             HoldProgressMs = 0f,
         };
+    }
+
+    private GameTask BuildReachableCurrentTask(GameTask sourceTask)
+    {
+        for (var i = 0; i < 50; i++)
+        {
+            GenerateObstacleLayout();
+            var candidate = RebuildTaskForCurrentLayout(sourceTask);
+            if (HasWalkablePath(GetPlayerCenter(_playerPosition), GetZoneCenter(candidate.Zone)))
+            {
+                return candidate;
+            }
+        }
+
+        return RebuildTaskForCurrentLayout(sourceTask);
+    }
+
+    private PointF GetPlayerCenter(PointF p) => new(p.X + _playerSize.Width / 2f, p.Y + _playerSize.Height / 2f);
+
+    private static PointF GetZoneCenter(RectangleF zone) => new(zone.X + zone.Width / 2f, zone.Y + zone.Height / 2f);
+
+    private bool HasWalkablePath(PointF from, PointF to)
+    {
+        const int cell = 20;
+
+        var cols = (int)(_playField.Width / cell);
+        var rows = (int)(_playField.Height / cell);
+        if (cols <= 0 || rows <= 0)
+        {
+            return false;
+        }
+
+        var start = ToCell(from, cell, cols, rows);
+        var goal = ToCell(to, cell, cols, rows);
+        if (start == goal)
+        {
+            return true;
+        }
+
+        var visited = new bool[cols, rows];
+        var q = new Queue<(int x, int y)>();
+        if (!IsCellWalkable(start.x, start.y, cell) || !IsCellWalkable(goal.x, goal.y, cell))
+        {
+            return false;
+        }
+
+        visited[start.x, start.y] = true;
+        q.Enqueue(start);
+        var dirs = new (int x, int y)[] { (1, 0), (-1, 0), (0, 1), (0, -1) };
+        while (q.Count > 0)
+        {
+            var (cx, cy) = q.Dequeue();
+            foreach (var (dx, dy) in dirs)
+            {
+                var nx = cx + dx;
+                var ny = cy + dy;
+                if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || visited[nx, ny])
+                {
+                    continue;
+                }
+
+                if (!IsCellWalkable(nx, ny, cell))
+                {
+                    continue;
+                }
+
+                if (nx == goal.x && ny == goal.y)
+                {
+                    return true;
+                }
+
+                visited[nx, ny] = true;
+                q.Enqueue((nx, ny));
+            }
+        }
+
+        return false;
+    }
+
+    private (int x, int y) ToCell(PointF point, int cell, int cols, int rows)
+    {
+        var localX = point.X - _playField.Left;
+        var localY = point.Y - _playField.Top;
+        var x = Math.Clamp((int)(localX / cell), 0, cols - 1);
+        var y = Math.Clamp((int)(localY / cell), 0, rows - 1);
+        return (x, y);
+    }
+
+    private bool IsCellWalkable(int x, int y, int cell)
+    {
+        var rect = new RectangleF(_playField.Left + x * cell + 2, _playField.Top + y * cell + 2, cell - 4, cell - 4);
+        return !IntersectsObstacles(rect);
     }
 
     private void Form1_KeyDown(object? sender, KeyEventArgs e)
@@ -864,8 +1019,9 @@ public partial class Form1 : Form
         var timeLeft = TimeSpan.FromSeconds(MathF.Max(0f, _sessionTimeLeftSeconds));
         g.DrawString($"Время  {timeLeft.Minutes:00}:{timeLeft.Seconds:00}", titleFont, text, statsCard.X + 12, statsCard.Y + 40);
         g.DrawString($"Счет  {_completedCount}/{TargetCompletedTasks}", textFont, text, statsCard.X + 12, statsCard.Y + 66);
+        g.DrawString($"Сложность  {GetDifficultyStage() + 1}", textFont, text, statsCard.X + 12, statsCard.Y + 84);
 
-        var chaosBarRect = new RectangleF(statsCard.X + 12, statsCard.Y + 102, statsCard.Width - 24, 18);
+        var chaosBarRect = new RectangleF(statsCard.X + 12, statsCard.Y + 112, statsCard.Width - 24, 18);
         using var chaosBack = new SolidBrush(Color.FromArgb(66, 74, 92));
         g.FillRectangle(chaosBack, chaosBarRect);
         var chaosColor = _chaosLevel < 40f
@@ -878,10 +1034,15 @@ public partial class Form1 : Form
         g.FillRectangle(chaosFill, chaosBarRect.X, chaosBarRect.Y, fillWidth, chaosBarRect.Height);
         using var chaosPen = new Pen(Color.FromArgb(148, 160, 185));
         g.DrawRectangle(chaosPen, chaosBarRect.X, chaosBarRect.Y, chaosBarRect.Width, chaosBarRect.Height);
-        g.DrawString($"Хаос  {_chaosLevel:0}/100", textFont, text, statsCard.X + 12, statsCard.Y + 128);
+        g.DrawString($"Хаос  {_chaosLevel:0}/100", textFont, text, statsCard.X + 12, statsCard.Y + 138);
 
         var riskText = _chaosLevel < 40f ? "Ситуация спокойная" : _chaosLevel < 70f ? "Риск средний" : "Высокий риск";
-        g.DrawString(riskText, textFont, subText, statsCard.X + 12, statsCard.Y + 154);
+        g.DrawString(riskText, textFont, subText, statsCard.X + 12, statsCard.Y + 162);
+        if (_highChaosSeconds > 0f)
+        {
+            var left = Math.Max(0f, HighChaosDefeatSeconds - _highChaosSeconds);
+            g.DrawString($"До поражения по хаосу  {left:0.0}с", textFont, Brushes.OrangeRed, statsCard.X + 12, statsCard.Y + 184);
+        }
     }
 
     private void DrawOverlay(Graphics g)
